@@ -132,7 +132,9 @@ func (v *TestVault) getUnsealKey(containerID string, port int) (string, error) {
 		logger.Default.Logf(v, "Found the Vault unseal key %s, proceeding to unseal", match[1])
 		return match[1], nil
 	}
-	return "", errors.New("Unable to determine the Vault unseal key, aborting")
+	return "",
+		fmt.Errorf("Unable to determine the Vault unseal key. The contents of the log \n%s", output)
+
 }
 
 func (v *TestVault) unseal(key string) error {
