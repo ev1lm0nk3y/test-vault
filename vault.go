@@ -120,11 +120,10 @@ func Setup() (*TestVault, error) {
 }
 
 func (v *TestVault) getUnsealKey(containerID string, port int) (string, error) {
-	unsealKeyRE := regexp.MustCompile("^Unseal Key: (.*)$")
+	unsealKeyRE := regexp.MustCompile("Unseal Key: (.*)")
 	logOutoutCmd := shell.Command{
 		Command: "docker",
-		Args:    []string{"logs", "-n", "10", containerID},
-		Logger:  logger.Default,
+		Args:    []string{"logs", containerID},
 	}
 	output := shell.RunCommandAndGetOutput(v, logOutoutCmd)
 
@@ -134,7 +133,6 @@ func (v *TestVault) getUnsealKey(containerID string, port int) (string, error) {
 	}
 	return "",
 		fmt.Errorf("Unable to determine the Vault unseal key. The contents of the log \n%s", output)
-
 }
 
 func (v *TestVault) unseal(key string) error {
