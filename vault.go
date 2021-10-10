@@ -85,7 +85,7 @@ func Setup() (*TestVault, error) {
 		Remove: true,
 		Logger: logger.Default,
 	}
-	containerID := docker.Run(v.t, "vault", runOpts)
+	containerID := docker.Run(v, "vault", runOpts)
 	var key string
 	if key, err = getUnsealKey(v, containerID, vaultPort); err != nil {
 		v.Fatalf("Starting Fatality: %s", err.Error())
