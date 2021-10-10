@@ -7,19 +7,18 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
-	"testing"
 
 	"github.com/phayes/freeport"
 
 	"github.com/gruntwork-io/terratest/modules/docker"
 	"github.com/gruntwork-io/terratest/modules/logger"
 	"github.com/gruntwork-io/terratest/modules/shell"
+	"github.com/gruntwork-io/terratest/modules/testing"
 
 	vault "github.com/hashicorp/vault/api"
 )
 
 var (
-	logs    = logger.New()
 	binPath string
 
 	// IgnoreTLS prevents the vault client from checking for TLS stuff
@@ -39,69 +38,104 @@ type appRole struct {
 // TestVault manages the temporary vault container
 type TestVault struct {
 	Client *vault.Client
-	t      *testing.T
+	State  States
+	t      testing.TestingT
 	name   string
 	appRole
 }
 
+// States are the various states that the dev vault module can be in
+type States int
+
+// States that the test vault can be in during testing. These are set at various points of execution.
+const (
+	Starting States = iota
+	Initializing
+	Ready
+	Stoping
+	Finished
+	Error
+	Failed
+	Aborted
+	Fatal
+)
+
 // Setup runs a memory only development version which is perfect for tests. It will run on any free
 // port on the host, so you can run multiple instances of the test(s) without colliding.
-func Setup(t *testing.T) (*TestVault, error) {
+func Setup() (*TestVault, error) {
 	vaultPort, err := freeport.GetFreePort()
 	if err != nil {
 		return nil, err
 	}
 	v := &TestVault{
-		name: fmt.Sprintf("terraform-vault-%d", vaultPort),
-		t:    t,
+		name:  fmt.Sprintf("terraform-vault-%d", vaultPort),
+		State: Starting,
 	}
 	runOpts := &docker.RunOptions{
 		Detach: true,
 		EnvironmentVariables: []string{
-			fmt.Sprintf("VAULT_DEV_ROOT_TOKEN_ID=%d", rootVaultToken),
+			fmt.Sprintf("VAULT_DEV_ROOT_TOKEN_ID=%s", rootVaultToken),
 			"VAULT_SKIP_VERIFY=true",
 		},
 		Name: v.name,
 		OtherOptions: []string{
-			"--cap-add=IPC_LOCK",
-			fmt.Sprintf("--port=%d:8200", vaultPort),
+			"--cap-add=IPC_LOCK", "-p",
+			fmt.Sprintf("%d:8200", vaultPort),
 		},
 		Remove: true,
-		Logger: logs,
+		Logger: logger.Default,
 	}
-	vaultStartLogs := docker.Run(t, "vault", runOpts)
-
-	unsealKeyRE := regexp.MustCompile("^Unseal Key: (.*)$")
-	var unsealKey string
-	match := unsealKeyRE.FindStringSubmatch(vaultStartLogs)
-	if match == nil {
-		return v, errors.New("Unable to determine the Vault unseal key, aborting")
+	containerID := docker.Run(v.t, "vault", runOpts)
+	var key string
+	if key, err = getUnsealKey(v, containerID, vaultPort); err != nil {
+		v.Fatalf("Starting Fatality: %s", err.Error())
+		return v, err
 	}
-	unsealKey = match[1]
-	logger.Logf(t, "Found the Vault unseal key, proceeding to unseal")
 
 	vConfig := vault.DefaultConfig()
 	vConfig.Address = fmt.Sprintf("http://127.0.0.1:%d", vaultPort)
 	if err = vConfig.ConfigureTLS(&vault.TLSConfig{Insecure: true}); err != nil {
+		v.Errorf("Error Configuring Vault Client: %s", err.Error())
 		return v, err
 	}
 	if v.Client, err = vault.NewClient(vConfig); err != nil {
+		v.Fatalf("Unable to create a vault client: %s", err.Error())
 		return v, err
 	}
 
-	if err = v.unsealVault(unsealKey); err != nil {
+	if err = v.unseal(key); err != nil {
+		v.Fatalf("Unable to unseal vault: %s", err.Error())
 		return v, err
 	}
 
 	if err = v.enableAuth(); err != nil {
+		v.FailNow()
 		return v, err
 	}
 
+	v.State = Initializing
 	v.createPolicyAndRole()
-	return v, err
+	v.State = Ready
+	return v, nil
 }
 
-func (v *TestVault) unsealVault(key string) error {
+func getUnsealKey(t testing.TestingT, containerID string, port int) (string, error) {
+	unsealKeyRE := regexp.MustCompile("^Unseal Key: (.*)$")
+	logOutoutCmd := shell.Command{
+		Command: "docker",
+		Args:    []string{"logs", "-n", "10", containerID},
+		Logger:  logger.Default,
+	}
+	output := shell.RunCommandAndGetOutput(t, logOutoutCmd)
+
+	if match := unsealKeyRE.FindStringSubmatch(output); match != nil {
+		logger.Logf(t, "Found the Vault unseal key, proceeding to unseal")
+		return match[1], nil
+	}
+	return "", errors.New("Unable to determine the Vault unseal key, aborting")
+}
+
+func (v *TestVault) unseal(key string) error {
 	sys := v.Client.Sys()
 	unsealResponse, err := sys.Unseal(key)
 	if err != nil {
@@ -133,7 +167,7 @@ func (v *TestVault) createPolicyAndRole() {
 		Env: map[string]string{
 			"VAULT_TOKEN": rootVaultToken,
 		},
-		Logger: logs,
+		Logger: logger.Default,
 	}
 
 	vaultCmd.Args = append([]string{"policy", "write", "cicd", policyFile}, IgnoreTLS...)
@@ -159,13 +193,16 @@ func (v *TestVault) createPolicyAndRole() {
 }
 
 // GetVaultValue will execute on the command you give it and then return the value of the data.
-func GetVaultValue(t *testing.T, cmd shell.Command, key string) (interface{}, error) {
-	var vr struct {
-		Data map[string]interface{} `json=data`
+func GetVaultValue(t testing.TestingT, cmd shell.Command, key string) (interface{}, error) {
+	type response struct {
+		Data  map[string]interface{} `json:"data"`
+		Other map[string]interface{} `json:"-"`
 	}
+
+	vr := new(response)
 	buf := bytes.NewBufferString(shell.RunCommandAndGetStdOut(t, cmd))
 	if err := json.Unmarshal(buf.Bytes(), vr); err != nil {
-		logs.Logf(t, "Unable to parse the Vault response for the {}", key)
+		logger.Logf(t, "Unable to parse the Vault response for the %s", key)
 		return nil, err
 	}
 	return vr.Data[key], nil
@@ -181,16 +218,54 @@ func GetVaultValue(t *testing.T, cmd shell.Command, key string) (interface{}, er
 
 // Stop will tell the docker container to quit. It should clean up on it's own.
 func (v *TestVault) Stop() {
+	v.State = Stoping
 	findVault := shell.Command{
 		Command: "docker",
-		Args:    []string{"ps", "--filter", fmt.Sprintf("name={}", v.name), "-q"},
+		Args:    []string{"ps", "--filter", fmt.Sprintf("name=%s", v.name), "-q"},
+		Logger:  logger.Default,
 	}
 	container := shell.RunCommandAndGetStdOut(v.t, findVault)
 	if container == "" {
-		logs.Logf(v.t, "No container found with the name {}", v.name)
+		logger.Logf(v.t, "No container found with the name %s", v.name)
 		return
 	}
 
 	stopOpts := &docker.StopOptions{}
-	docker.Stop(v.t, []string{container}, stopOpts)
+	docker.Stop(v, []string{container}, stopOpts)
+}
+
+// Fail interface methods to have TestVault satisfy the terratest testing.TestingT interface
+func (v TestVault) Fail() {
+	logger.Default.Logf(v, "Test Vault %s is in a Failed state", v.Name())
+	v.State = Failed
+}
+
+// FailNow fails immediately
+func (v TestVault) FailNow() {
+	v.State = Aborted
+}
+
+// Fatal is just your standard message
+func (v TestVault) Fatal(args ...interface{}) {
+	v.State = Fatal
+}
+
+// Fatalf has args you can pass in
+func (v TestVault) Fatalf(format string, args ...interface{}) {
+	v.State = Fatal
+}
+
+// Error is just that, an error
+func (v TestVault) Error(args ...interface{}) {
+	v.State = Error
+}
+
+// Errorf has args
+func (v TestVault) Errorf(format string, args ...interface{}) {
+	v.State = Error
+}
+
+// Name returns the name of the vault instance you have running
+func (v TestVault) Name() string {
+	return v.name
 }
