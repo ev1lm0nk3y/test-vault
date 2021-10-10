@@ -87,8 +87,8 @@ func Setup() (*TestVault, error) {
 	}
 	containerID := docker.Run(v, "vault", runOpts)
 	var key string
-	if key, err = getUnsealKey(v, containerID, vaultPort); err != nil {
-		v.Fatalf("Starting Fatality: %s", err.Error())
+	if key, err = v.getUnsealKey(containerID, vaultPort); err != nil {
+		v.Fatalf("Fatal Unsealing: %s", err.Error())
 		return v, err
 	}
 
@@ -119,17 +119,17 @@ func Setup() (*TestVault, error) {
 	return v, nil
 }
 
-func getUnsealKey(t testing.TestingT, containerID string, port int) (string, error) {
+func (v *TestVault) getUnsealKey(containerID string, port int) (string, error) {
 	unsealKeyRE := regexp.MustCompile("^Unseal Key: (.*)$")
 	logOutoutCmd := shell.Command{
 		Command: "docker",
 		Args:    []string{"logs", "-n", "10", containerID},
 		Logger:  logger.Default,
 	}
-	output := shell.RunCommandAndGetOutput(t, logOutoutCmd)
+	output := shell.RunCommandAndGetOutput(v, logOutoutCmd)
 
 	if match := unsealKeyRE.FindStringSubmatch(output); match != nil {
-		logger.Logf(t, "Found the Vault unseal key, proceeding to unseal")
+		logger.Default.Logf(v, "Found the Vault unseal key %s, proceeding to unseal", match[1])
 		return match[1], nil
 	}
 	return "", errors.New("Unable to determine the Vault unseal key, aborting")
