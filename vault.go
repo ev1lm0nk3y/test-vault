@@ -112,18 +112,18 @@ func Setup() (*TestVault, error) {
 // Unseal Vault
 func (v *TestVault) Unseal() error {
 	key, err := v.getUnsealKey()
-	if err == nil {
-		v.Fatal(err.Error())
+
+	if err != nil {
+		log.Fatal(err.Error())
 	}
 	sys := v.Client.Sys()
 	unsealResponse, err := sys.Unseal(key)
 	if err != nil {
 		return err
 	}
-	fmt.Println(unsealResponse)
-	//if unsealResponse.Sealed {
-	//	return fmt.Errorf("Vault is still sealed")
-	//}
+	if unsealResponse.Sealed {
+		return fmt.Errorf("Vault is still sealed")
+	}
 	return nil
 }
 
@@ -139,7 +139,6 @@ func (v *TestVault) getUnsealKey() (string, error) {
 
 		if match := unsealKeyRE.FindStringSubmatch(output); match != nil {
 			logger.Default.Logf(v, "Found the Vault unseal key, proceeding to unseal")
-			v.containerID = match[1]
 			return match[1], nil
 		}
 		return "", fmt.Errorf("Unable to determine the Vault unseal key. Retrying")
@@ -198,10 +197,10 @@ func (v *TestVault) CreateAppRoleWithPolicy(policyName, policyFile, roleName str
 func GetVaultValues(t testing.TestingT, cmd shell.Command, keys ...string) (map[string]interface{}, error) {
 	type response struct {
 		Data  map[string]interface{} `json:"data"`
-		Other map[string]interface{} `json:"-"`
+		Other interface{}            `json:"-"`
 	}
 
-	vr := new(response)
+	vr := &response{}
 	buf := bytes.NewBufferString(shell.RunCommandAndGetStdOut(t, cmd))
 	if err := json.Unmarshal(buf.Bytes(), vr); err != nil {
 		logger.Logf(t, "Unable to parse the Vault response while fetching the data")
@@ -217,19 +216,9 @@ func GetVaultValues(t testing.TestingT, cmd shell.Command, keys ...string) (map[
 // Stop will tell the docker container to quit. It should clean up on it's own.
 func (v *TestVault) Stop() {
 	v.State = Stoping
-	findVault := shell.Command{
-		Command: "docker",
-		Args:    []string{"ps", "--filter", fmt.Sprintf("name=%s", v.name), "-q"},
-		Logger:  logger.Default,
-	}
-	container := shell.RunCommandAndGetStdOut(v, findVault)
-	if container == "" {
-		logger.Logf(v, "No container found with the name %s", v.name)
-		return
-	}
-
 	stopOpts := &docker.StopOptions{}
-	docker.Stop(v, []string{container}, stopOpts)
+	docker.Stop(v, []string{v.containerID}, stopOpts)
+	v.State = Finished
 }
 
 // These are all here to satify the testing.TestingT interface. They don't really do anything, yet
