@@ -33,7 +33,8 @@ const (
 	policyFile     = "policy.hcl"
 )
 
-type appRole struct {
+// AppRole is a holder for the vault approle credentials
+type AppRole struct {
 	RoleID   string
 	SecretID string
 }
@@ -42,9 +43,7 @@ type appRole struct {
 type TestVault struct {
 	Client *vault.Client
 	State  States
-	t      testing.TestingT
 	name   string
-	appRole
 }
 
 // States are the various states that the dev vault module can be in
@@ -87,7 +86,7 @@ func Setup() (*TestVault, error) {
 			fmt.Sprintf("%d:8200", vaultPort),
 		},
 		Remove: true,
-		Logger: logger.Default,
+		Logger: logger.Discard,
 	}
 	containerID := docker.Run(v, "vault", runOpts)
 	var key string
@@ -128,12 +127,13 @@ func (v *TestVault) getUnsealKey(containerID string, port int) (string, error) {
 	logOutoutCmd := shell.Command{
 		Command: "docker",
 		Args:    []string{"logs", containerID},
+		Logger:  logger.Discard,
 	}
-	return retry.DoWithRetry(v, "Read Vault Startup Logs", 10, 3*time.Second, func() (string, error) {
+	return retry.DoWithRetryE(v, "Read Vault Startup Logs", 10, 3*time.Second, func() (string, error) {
 		output := shell.RunCommandAndGetStdOut(v, logOutoutCmd)
 
 		if match := unsealKeyRE.FindStringSubmatch(output); match != nil {
-			logger.Default.Logf(v, "Found the Vault unseal key %s, proceeding to unseal", match[1])
+			logger.Default.Logf(v, "Found the Vault unseal key, proceeding to unseal")
 			return match[1], nil
 		}
 		return "",
@@ -165,8 +165,8 @@ func (v *TestVault) enableAuth() error {
 }
 
 // This will create the policy which will allow the test to perform the creation of roles in the
-// test vault.
-func (v *TestVault) createPolicyAndRole() {
+// test vault. If any of the commands fail, Terratest will gently exit the test run.
+func (v *TestVault) createPolicyAndRole() AppRole {
 	IgnoreTLS = []string{"-tls-skip-verify", "-address", v.Client.Address()}
 	vaultCmd := shell.Command{
 		Command: binPath,
@@ -177,29 +177,32 @@ func (v *TestVault) createPolicyAndRole() {
 	}
 
 	vaultCmd.Args = append([]string{"policy", "write", "cicd", policyFile}, IgnoreTLS...)
-	shell.RunCommand(v.t, vaultCmd)
+	shell.RunCommand(v, vaultCmd)
 
 	vaultCmd.Args = append([]string{"write", "auth/approle/role/terratest", "policies=cicd"}, IgnoreTLS...)
-	shell.RunCommand(v.t, vaultCmd)
+	shell.RunCommand(v, vaultCmd)
 
+	var ar AppRole
 	var err error
 	var tmpVal interface{}
 	vaultCmd.Args = append([]string{"read", "auth/approle/role/terratest/role-id", "-format=json"}, IgnoreTLS...)
-	if tmpVal, err = GetVaultValue(v.t, vaultCmd, "role_id"); err != nil {
-		panic(err)
+	if tmpVal, err = GetVaultValues(v, vaultCmd, "role_id"); err != nil {
+		v.Fatal(err)
+		return ar
 	}
-	v.RoleID = reflect.ValueOf(tmpVal).String()
+	ar.RoleID = reflect.ValueOf(tmpVal).String()
 
 	vaultCmd.Args = append([]string{"write", "-f", "auth/approle/role/terratest/secret-id", "-format=json"},
 		IgnoreTLS...)
-	if tmpVal, err = GetVaultValue(v.t, vaultCmd, "secret_id"); err != nil {
-		panic(err)
+	if tmpVal, err = GetVaultValues(v, vaultCmd, "secret_id"); err != nil {
+		log.Fatal(err)
 	}
-	v.SecretID = reflect.ValueOf(tmpVal).String()
+	ar.SecretID = reflect.ValueOf(tmpVal).String()
+	return ar
 }
 
-// GetVaultValue will execute on the command you give it and then return the value of the data.
-func GetVaultValue(t testing.TestingT, cmd shell.Command, key string) (interface{}, error) {
+// GetVaultValues will execute on the command you give it and then return the value of the data that you specified.
+func GetVaultValues(t testing.TestingT, cmd shell.Command, keys ...string) (map[string]interface{}, error) {
 	type response struct {
 		Data  map[string]interface{} `json:"data"`
 		Other map[string]interface{} `json:"-"`
@@ -208,10 +211,14 @@ func GetVaultValue(t testing.TestingT, cmd shell.Command, key string) (interface
 	vr := new(response)
 	buf := bytes.NewBufferString(shell.RunCommandAndGetStdOut(t, cmd))
 	if err := json.Unmarshal(buf.Bytes(), vr); err != nil {
-		logger.Logf(t, "Unable to parse the Vault response for the %s", key)
+		logger.Logf(t, "Unable to parse the Vault response while fetching the data")
 		return nil, err
 	}
-	return vr.Data[key], nil
+	var retval map[string]interface{}
+	for _, key := range keys {
+		retval[key] = vr.Data[key]
+	}
+	return retval, nil
 }
 
 //func init() {
@@ -230,9 +237,9 @@ func (v *TestVault) Stop() {
 		Args:    []string{"ps", "--filter", fmt.Sprintf("name=%s", v.name), "-q"},
 		Logger:  logger.Default,
 	}
-	container := shell.RunCommandAndGetStdOut(v.t, findVault)
+	container := shell.RunCommandAndGetStdOut(v, findVault)
 	if container == "" {
-		logger.Logf(v.t, "No container found with the name %s", v.name)
+		logger.Logf(v, "No container found with the name %s", v.name)
 		return
 	}
 
