@@ -41,12 +41,13 @@ type AppRole struct {
 
 // TestVault manages the temporary vault container
 type TestVault struct {
-	Client *vault.Client
-	State  States
-	name   string
+	Client      *vault.Client
+	State       States
+	name        string
+	containerID string
 }
 
-// States are the various states that the dev vault module can be in
+-// States are the various states that the dev vault module can be in
 type States int
 
 // States that the test vault can be in during testing. These are set at various points of execution.
@@ -88,13 +89,7 @@ func Setup() (*TestVault, error) {
 		Remove: true,
 		Logger: logger.Discard,
 	}
-	containerID := docker.Run(v, "vault", runOpts)
-	var key string
-	if key, err = v.getUnsealKey(containerID, vaultPort); err != nil {
-		v.Fatalf("Fatal Unsealing: %s", err.Error())
-		return v, err
-	}
-
+	v.containerID = docker.Run(v, "vault", runOpts)
 	vConfig := vault.DefaultConfig()
 	vConfig.Address = fmt.Sprintf("http://127.0.0.1:%d", vaultPort)
 	if err = vConfig.ConfigureTLS(&vault.TLSConfig{Insecure: true}); err != nil {
@@ -105,28 +100,34 @@ func Setup() (*TestVault, error) {
 		v.Fatalf("Unable to create a vault client: %s", err.Error())
 		return v, err
 	}
+	IgnoreTLS = []string{"-tls-skip-verify", "-address", v.Client.Address()}
 
-	if err = v.unseal(key); err != nil {
-		v.Fatalf("Unable to unseal vault: %s", err.Error())
-		return v, err
-	}
-
-	if err = v.enableAuth(); err != nil {
-		v.FailNow()
-		return v, err
-	}
-
-	v.State = Initializing
-	v.createPolicyAndRole()
 	v.State = Ready
 	return v, nil
 }
 
-func (v *TestVault) getUnsealKey(containerID string, port int) (string, error) {
+// Unseal Vault
+func (v *TestVault) Unseal() error {
+	key, err := v.getUnsealKey()
+	if err == nil {
+		v.Fatal(err.Error())
+	}
+	sys := v.Client.Sys()
+	unsealResponse, err := sys.Unseal(key)
+	if err != nil {
+		return err
+	}
+	if unsealResponse.Sealed {
+		return errors.New("Vault is still sealed")
+	}
+	return nil
+}
+
+func (v *TestVault) getUnsealKey() (string, error) {
 	unsealKeyRE := regexp.MustCompile("Unseal Key: (.*)")
 	logOutoutCmd := shell.Command{
 		Command: "docker",
-		Args:    []string{"logs", containerID},
+		Args:    []string{"logs", v.containerID},
 		Logger:  logger.Discard,
 	}
 	return retry.DoWithRetryE(v, "Read Vault Startup Logs", 10, 3*time.Second, func() (string, error) {
@@ -141,33 +142,18 @@ func (v *TestVault) getUnsealKey(containerID string, port int) (string, error) {
 	})
 }
 
-func (v *TestVault) unseal(key string) error {
+// EnableAuth allows you to enable any Vault auth mechanism. options can be nil as the default is "auth/<authType>"
+func (v *TestVault) EnableAuth(authType string, options *vault.EnableAuthOptions) error {
 	sys := v.Client.Sys()
-	unsealResponse, err := sys.Unseal(key)
-	if err != nil {
-		return err
+	if options == nil {
+		options = &vault.EnableAuthOptions{Type: authType}
 	}
-	if unsealResponse.Sealed {
-		return errors.New("Vault is still sealed")
-	}
-	return nil
+	return sys.EnableAuthWithOptions(fmt.Sprintf("auth/%s", authType), options)
 }
 
-func (v *TestVault) enableAuth() error {
-	sys := v.Client.Sys()
-	options := &vault.EnableAuthOptions{Type: "approle"}
-	if err := sys.EnableAuthWithOptions("auth/approle", options); err != nil {
-		return err
-	}
-
-	options = &vault.EnableAuthOptions{Type: "kubernetes"}
-	return sys.EnableAuthWithOptions("", options)
-}
-
-// This will create the policy which will allow the test to perform the creation of roles in the
-// test vault. If any of the commands fail, Terratest will gently exit the test run.
-func (v *TestVault) createPolicyAndRole() AppRole {
-	IgnoreTLS = []string{"-tls-skip-verify", "-address", v.Client.Address()}
+// CreateAppRoleWithPolicy will create the policy and then attqch your role to it
+// If any of the commands fail, Terratest will gently exit the test run.
+func (v *TestVault) CreateAppRoleWithPolicy(policyName, policyFile, roleName string) AppRole {
 	vaultCmd := shell.Command{
 		Command: binPath,
 		Env: map[string]string{
@@ -176,23 +162,26 @@ func (v *TestVault) createPolicyAndRole() AppRole {
 		Logger: logger.Default,
 	}
 
-	vaultCmd.Args = append([]string{"policy", "write", "cicd", policyFile}, IgnoreTLS...)
+	policyCmd := []string{"policy", "write", policyName, policyFile}
+	vaultCmd.Args = append(policyCmd, IgnoreTLS...)
 	shell.RunCommand(v, vaultCmd)
 
-	vaultCmd.Args = append([]string{"write", "auth/approle/role/terratest", "policies=cicd"}, IgnoreTLS...)
+	roleCmd := []string{"write", fmt.Sprintf("auth/approle/role/%s", roleName),
+		fmt.Sprintf("policies=%s", policyName)}
+	vaultCmd.Args = append(roleCmd, IgnoreTLS...)
 	shell.RunCommand(v, vaultCmd)
 
 	var ar AppRole
 	var err error
 	var tmpVal interface{}
-	vaultCmd.Args = append([]string{"read", "auth/approle/role/terratest/role-id", "-format=json"}, IgnoreTLS...)
+	vaultCmd.Args = append([]string{"read", fmt.Sprintf("auth/approle/role/%s/role-id", roleName), "-format=json"}, IgnoreTLS...)
 	if tmpVal, err = GetVaultValues(v, vaultCmd, "role_id"); err != nil {
 		v.Fatal(err)
 		return ar
 	}
 	ar.RoleID = reflect.ValueOf(tmpVal).String()
 
-	vaultCmd.Args = append([]string{"write", "-f", "auth/approle/role/terratest/secret-id", "-format=json"},
+	vaultCmd.Args = append([]string{"write", "-f", fmt.Sprintf("auth/approle/role/%s/secret-id", roleName), "-format=json"},
 		IgnoreTLS...)
 	if tmpVal, err = GetVaultValues(v, vaultCmd, "secret_id"); err != nil {
 		log.Fatal(err)
@@ -220,14 +209,6 @@ func GetVaultValues(t testing.TestingT, cmd shell.Command, keys ...string) (map[
 	}
 	return retval, nil
 }
-
-//func init() {
-//	var err error
-//	binPath, err = exec.LookPath("vault")
-//	if err != nil {
-//		panic("Unable to locate the vault binary")
-//	}
-//}
 
 // Stop will tell the docker container to quit. It should clean up on it's own.
 func (v *TestVault) Stop() {
