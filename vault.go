@@ -129,20 +129,20 @@ func (v *TestVault) Unseal() error {
 
 func (v *TestVault) getUnsealKey() (string, error) {
 	unsealKeyRE := regexp.MustCompile("Unseal Key: (.*)")
-	logOutoutCmd := shell.Command{
+	logOutputCmd := shell.Command{
 		Command: "docker",
 		Args:    []string{"logs", v.containerID},
 		Logger:  logger.Discard,
 	}
 	return retry.DoWithRetryE(v, "Read Vault Startup Logs", 10, 3*time.Second, func() (string, error) {
-		output := shell.RunCommandAndGetStdOut(v, logOutoutCmd)
+		output := shell.RunCommandAndGetStdOut(v, logOutputCmd)
 
 		if match := unsealKeyRE.FindStringSubmatch(output); match != nil {
 			logger.Default.Logf(v, "Found the Vault unseal key, proceeding to unseal")
+			v.containerID = match[1]
 			return match[1], nil
 		}
-		return "",
-			fmt.Errorf("Unable to determine the Vault unseal key. Retrying")
+		return "", fmt.Errorf("Unable to determine the Vault unseal key. Retrying")
 	})
 }
 
@@ -232,38 +232,13 @@ func (v *TestVault) Stop() {
 	docker.Stop(v, []string{container}, stopOpts)
 }
 
-// Fail interface methods to have TestVault satisfy the terratest testing.TestingT interface
-func (v TestVault) Fail() {
-	logger.Default.Logf(v, "Test Vault %s is in a Failed state", v.Name())
-	v.State = Failed
-}
-
-// FailNow fails immediately
-func (v TestVault) FailNow() {
-	v.State = Aborted
-}
-
-// Fatal is just your standard message
-func (v TestVault) Fatal(args ...interface{}) {
-	v.State = Fatal
-	log.Fatal(args...)
-}
-
-// Fatalf has args you can pass in
-func (v TestVault) Fatalf(format string, args ...interface{}) {
-	v.State = Fatal
-	log.Fatalf(format, args...)
-}
-
-// Error is just that, an error
-func (v TestVault) Error(args ...interface{}) {
-	v.State = Error
-}
-
-// Errorf has args
-func (v TestVault) Errorf(format string, args ...interface{}) {
-	v.State = Error
-}
+// These are all here to satify the testing.TestingT interface. They don't really do anything, yet
+func (v TestVault) Fail()                                     {}
+func (v TestVault) FailNow()                                  {}
+func (v TestVault) Fatal(args ...interface{})                 {}
+func (v TestVault) Fatalf(format string, args ...interface{}) {}
+func (v TestVault) Error(args ...interface{})                 {}
+func (v TestVault) Errorf(format string, args ...interface{}) {}
 
 // Name returns the name of the vault instance you have running
 func (v TestVault) Name() string {
