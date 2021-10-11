@@ -79,6 +79,7 @@ func Setup() (*TestVault, error) {
 		EnvironmentVariables: []string{
 			fmt.Sprintf("VAULT_DEV_ROOT_TOKEN_ID=%s", rootVaultToken),
 			"VAULT_SKIP_VERIFY=true",
+			"VAULT_API_ADDR=http://127.0.0.1:8200",
 		},
 		Name: v.name,
 		OtherOptions: []string{
@@ -128,7 +129,7 @@ func (v *TestVault) getUnsealKey(containerID string, port int) (string, error) {
 		Command: "docker",
 		Args:    []string{"logs", containerID},
 	}
-	retry.DoWithRetry(v, "Read Vault Startup Logs", 10, 3*time.Second, func() (string, error) {
+	return retry.DoWithRetry(v, "Read Vault Startup Logs", 10, 3*time.Second, func() (string, error) {
 		output := shell.RunCommandAndGetStdOut(v, logOutoutCmd)
 
 		if match := unsealKeyRE.FindStringSubmatch(output); match != nil {
@@ -138,7 +139,6 @@ func (v *TestVault) getUnsealKey(containerID string, port int) (string, error) {
 		return "",
 			fmt.Errorf("Unable to determine the Vault unseal key. Retrying")
 	})
-	return "", fmt.Errorf("Unlock key was never discovered. Bailing")
 }
 
 func (v *TestVault) unseal(key string) error {
