@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"reflect"
 	"regexp"
+	"time"
 
 	"github.com/phayes/freeport"
 
 	"github.com/gruntwork-io/terratest/modules/docker"
 	"github.com/gruntwork-io/terratest/modules/logger"
+	"github.com/gruntwork-io/terratest/modules/retry"
 	"github.com/gruntwork-io/terratest/modules/shell"
 	"github.com/gruntwork-io/terratest/modules/testing"
 
@@ -125,14 +128,17 @@ func (v *TestVault) getUnsealKey(containerID string, port int) (string, error) {
 		Command: "docker",
 		Args:    []string{"logs", containerID},
 	}
-	output := shell.RunCommandAndGetOutput(v, logOutoutCmd)
+	retry.DoWithRetry(v, "Read Vault Startup Logs", 10, 3*time.Second, func() (string, error) {
+		output := shell.RunCommandAndGetStdOut(v, logOutoutCmd)
 
-	if match := unsealKeyRE.FindStringSubmatch(output); match != nil {
-		logger.Default.Logf(v, "Found the Vault unseal key %s, proceeding to unseal", match[1])
-		return match[1], nil
-	}
-	return "",
-		fmt.Errorf("Unable to determine the Vault unseal key. The contents of the log \n%s", output)
+		if match := unsealKeyRE.FindStringSubmatch(output); match != nil {
+			logger.Default.Logf(v, "Found the Vault unseal key %s, proceeding to unseal", match[1])
+			return match[1], nil
+		}
+		return "",
+			fmt.Errorf("Unable to determine the Vault unseal key. Retrying")
+	})
+	return "", fmt.Errorf("Unlock key was never discovered. Bailing")
 }
 
 func (v *TestVault) unseal(key string) error {
@@ -248,11 +254,13 @@ func (v TestVault) FailNow() {
 // Fatal is just your standard message
 func (v TestVault) Fatal(args ...interface{}) {
 	v.State = Fatal
+	log.Fatal(args...)
 }
 
 // Fatalf has args you can pass in
 func (v TestVault) Fatalf(format string, args ...interface{}) {
 	v.State = Fatal
+	log.Fatalf(format, args...)
 }
 
 // Error is just that, an error
