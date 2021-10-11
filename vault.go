@@ -1,5 +1,9 @@
 package vault
 
+/*
+This package deploys a dev vault instance in docker so that we can perform operations on it
+*/
+
 import (
 	"bytes"
 	"encoding/json"
@@ -47,7 +51,7 @@ type TestVault struct {
 	containerID string
 }
 
--// States are the various states that the dev vault module can be in
+// States are the various states that the dev vault module can be in
 type States int
 
 // States that the test vault can be in during testing. These are set at various points of execution.
